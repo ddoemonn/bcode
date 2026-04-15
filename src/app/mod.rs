@@ -60,6 +60,9 @@ pub struct App {
     pub setup_api_key: String,
     pub input_history: Vec<String>,
     pub history_idx: Option<usize>,
+    pub checkpoint_stack: Vec<usize>,
+    pub redo_stack: Vec<usize>,
+    pub turn_counter: usize,
     stream_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -87,6 +90,9 @@ impl App {
             setup_api_key: String::new(),
             input_history: Vec::new(),
             history_idx: None,
+            checkpoint_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            turn_counter: 0,
             stream_task: None,
         }
     }
@@ -514,10 +520,40 @@ impl App {
                 self.messages.push(Message::assistant(text));
             }
             "/undo" => {
-                self.messages.push(Message::assistant("undo: no checkpoints available in this session"));
+                if let Some(turn) = self.checkpoint_stack.pop() {
+                    match crate::checkpoint::restore(&self.session_id, turn) {
+                        Ok(_) => {
+                            self.redo_stack.push(turn);
+                            self.messages.push(Message::assistant(
+                                format!("reverted to checkpoint {turn}"),
+                            ));
+                        }
+                        Err(e) => {
+                            self.checkpoint_stack.push(turn);
+                            self.messages.push(Message::assistant(format!("undo failed: {e}")));
+                        }
+                    }
+                } else {
+                    self.messages.push(Message::assistant("no checkpoints to undo"));
+                }
             }
             "/redo" => {
-                self.messages.push(Message::assistant("redo: nothing to redo"));
+                if let Some(turn) = self.redo_stack.pop() {
+                    match crate::checkpoint::restore(&self.session_id, turn) {
+                        Ok(_) => {
+                            self.checkpoint_stack.push(turn);
+                            self.messages.push(Message::assistant(
+                                format!("re-applied checkpoint {turn}"),
+                            ));
+                        }
+                        Err(e) => {
+                            self.redo_stack.push(turn);
+                            self.messages.push(Message::assistant(format!("redo failed: {e}")));
+                        }
+                    }
+                } else {
+                    self.messages.push(Message::assistant("nothing to redo"));
+                }
             }
             _ => {
                 self.messages.push(Message::assistant(format!("unknown command: {cmd}  (try /help)")));
@@ -558,6 +594,27 @@ impl App {
         self.status = Status::Executing;
         let call = self.pending_calls[self.current_call_idx].clone();
         let tx2 = tx.clone();
+
+        let turn = self.turn_counter;
+        let session_id = self.session_id.clone();
+        let is_write_op = matches!(
+            call.name.as_str(),
+            "write_file" | "replace_in_file" | "bash"
+        );
+
+        if is_write_op {
+            let paths: Vec<&str> = if call.name == "bash" {
+                Vec::new()
+            } else {
+                call.input["path"].as_str().map(|p| vec![p]).unwrap_or_default()
+            };
+            if let Ok(cp) = crate::checkpoint::snapshot(&session_id, turn, &paths) {
+                self.checkpoint_stack.push(cp.turn);
+                self.redo_stack.clear();
+                self.turn_counter += 1;
+            }
+        }
+
         tokio::spawn(async move {
             let output = tokio::task::spawn_blocking(move || {
                 tools::execute(&call.name, call.input.clone())

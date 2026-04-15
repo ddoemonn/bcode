@@ -39,6 +39,15 @@ fn render_left(f: &mut Frame, app: &App, area: Rect) {
         app.provider.model()
     );
 
+    let ckpt_span = if !app.checkpoint_stack.is_empty() {
+        Span::styled(
+            format!("  ↩ {}", app.checkpoint_stack.len()),
+            Style::default().fg(theme::SUBTLE),
+        )
+    } else {
+        Span::raw("")
+    };
+
     let err_text = if let Status::Error(ref e) = app.status {
         format!("  {e}")
     } else {
@@ -49,6 +58,7 @@ fn render_left(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(provider_model, Style::default().fg(theme::DIM)),
         Span::styled("│ ", Style::default().fg(theme::BORDER)),
         status_span,
+        ckpt_span,
         Span::styled(err_text, Style::default().fg(theme::ERROR)),
     ]);
 
