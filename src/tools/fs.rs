@@ -169,6 +169,45 @@ impl Tool for Glob {
     }
 }
 
+pub struct SearchInFiles;
+
+impl Tool for SearchInFiles {
+    fn name(&self) -> &str { "search_in_files" }
+    fn description(&self) -> &str {
+        "Search for a text pattern across files matching a glob. Returns file:line: content matches (max 100)."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Text to search for" },
+                "glob":    { "type": "string", "description": "File glob to search in (default: **/*)" }
+            },
+            "required": ["pattern"]
+        })
+    }
+    fn execute(&self, input: Value) -> Result<String> {
+        let pattern   = input["pattern"].as_str().context("missing pattern")?;
+        let glob_pat  = input["glob"].as_str().unwrap_or("**/*");
+
+        let mut matches: Vec<String> = Vec::new();
+
+        for entry in glob::glob(glob_pat).context("invalid glob")?.filter_map(|e| e.ok()) {
+            if !entry.is_file() { continue }
+            let Ok(content) = std::fs::read_to_string(&entry) else { continue };
+            for (i, line) in content.lines().enumerate() {
+                if line.contains(pattern) {
+                    matches.push(format!("{}:{}: {}", entry.display(), i + 1, line.trim()));
+                    if matches.len() >= 100 { break }
+                }
+            }
+            if matches.len() >= 100 { break }
+        }
+
+        if matches.is_empty() { Ok("no matches".to_string()) } else { Ok(matches.join("\n")) }
+    }
+}
+
 fn fmt_size(bytes: u64) -> String {
     if bytes >= 1_048_576 {
         format!("{:.1}M", bytes as f64 / 1_048_576.0)

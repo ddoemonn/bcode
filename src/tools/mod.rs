@@ -18,6 +18,7 @@ pub fn registry() -> Vec<Box<dyn Tool>> {
         Box::new(fs::ReplaceInFile),
         Box::new(fs::ListDir),
         Box::new(fs::Glob),
+        Box::new(fs::SearchInFiles),
         Box::new(shell::Bash),
     ]
 }

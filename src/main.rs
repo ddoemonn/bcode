@@ -1,11 +1,13 @@
 mod app;
+mod config;
 mod provider;
 mod session;
 mod tools;
 mod ui;
 
-use anyhow::Context;
+use app::App;
 use clap::{Parser, ValueEnum};
+use config::Config;
 use provider::{
     anthropic::AnthropicProvider, ollama::OllamaProvider, openai::OpenAIProvider, Provider,
 };
@@ -21,8 +23,8 @@ enum ProviderArg {
 #[derive(Parser, Debug)]
 #[command(name = "bcode", about = "Terminal AI coding agent")]
 struct Cli {
-    #[arg(short, long, default_value = "anthropic")]
-    provider: ProviderArg,
+    #[arg(short, long)]
+    provider: Option<ProviderArg>,
 
     #[arg(short, long)]
     model: Option<String>,
@@ -37,36 +39,57 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let config = Config::load();
 
-    let provider: Arc<dyn Provider> = match cli.provider {
-        ProviderArg::Anthropic => {
-            let key = cli
-                .api_key
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .context("ANTHROPIC_API_KEY not set")?;
-            let model = cli.model.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-            Arc::new(AnthropicProvider::new(key, model))
-        }
-        ProviderArg::Openai => {
-            let key = cli
-                .api_key
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                .context("OPENAI_API_KEY not set")?;
-            let model = cli.model.unwrap_or_else(|| "gpt-4o".to_string());
-            Arc::new(OpenAIProvider::new(key, model))
-        }
-        ProviderArg::Ollama => {
-            let model = cli.model.unwrap_or_else(|| "llama3.2".to_string());
-            Arc::new(OllamaProvider::new(model))
-        }
+    let provider = try_build_provider(&cli, &config);
+
+    let mut app = match provider {
+        Some(p) => App::new(p),
+        None    => App::needs_setup(),
     };
 
-    let mut app = app::App::new(provider);
-
     if let Some(id) = cli.resume {
-        let s = session::load(&id).context(format!("session {id} not found"))?;
-        app = app.with_session(s);
+        if let Ok(s) = session::load(&id) {
+            app = app.with_session(s);
+        }
     }
 
     app.run().await
+}
+
+fn try_build_provider(cli: &Cli, config: &Config) -> Option<Arc<dyn Provider>> {
+    let provider_name = cli.provider.as_ref()
+        .map(|p| match p { ProviderArg::Anthropic => "anthropic", ProviderArg::Openai => "openai", ProviderArg::Ollama => "ollama" })
+        .or_else(|| config.provider.as_deref())
+        .unwrap_or("anthropic");
+
+    let model = cli.model.clone()
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| default_model(provider_name).to_string());
+
+    match provider_name {
+        "openai" => {
+            let key = cli.api_key.clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+                .or_else(|| config.api_keys.get("openai").cloned())?;
+            Some(Arc::new(OpenAIProvider::new(key, model)))
+        }
+        "ollama" => {
+            Some(Arc::new(OllamaProvider::new(model)))
+        }
+        _ => {
+            let key = cli.api_key.clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .or_else(|| config.api_keys.get("anthropic").cloned())?;
+            Some(Arc::new(AnthropicProvider::new(key, model)))
+        }
+    }
+}
+
+fn default_model(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "gpt-4o",
+        "ollama" => "llama3.2",
+        _        => "claude-sonnet-4-6",
+    }
 }
