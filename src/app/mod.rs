@@ -63,11 +63,15 @@ pub struct App {
     pub checkpoint_stack: Vec<usize>,
     pub redo_stack: Vec<usize>,
     pub turn_counter: usize,
+    pub session_search: String,
     stream_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
+        let cfg = Config::load();
+        let always_allowed: HashSet<String> =
+            cfg.always_allowed_tools.into_iter().collect();
         Self {
             messages: Vec::new(),
             streaming_text: String::new(),
@@ -81,7 +85,7 @@ impl App {
             provider,
             pending_calls: Vec::new(),
             current_call_idx: 0,
-            always_allowed: HashSet::new(),
+            always_allowed,
             session_id: session::new_id(),
             session_list: Vec::new(),
             session_selected: 0,
@@ -93,6 +97,7 @@ impl App {
             checkpoint_stack: Vec::new(),
             redo_stack: Vec::new(),
             turn_counter: 0,
+            session_search: String::new(),
             stream_task: None,
         }
     }
@@ -196,6 +201,16 @@ impl App {
                 KeyCode::Enter => self.load_selected_session(),
                 KeyCode::Esc => {
                     self.status = Status::Ready;
+                }
+                KeyCode::Char(c) => {
+                    self.session_search.push(c);
+                    self.session_list = session::list_filtered(&self.session_search);
+                    self.session_selected = 0;
+                }
+                KeyCode::Backspace => {
+                    self.session_search.pop();
+                    self.session_list = session::list_filtered(&self.session_search);
+                    self.session_selected = 0;
                 }
                 _ => {}
             },
@@ -403,6 +418,7 @@ impl App {
     }
 
     pub fn open_session_browser(&mut self) {
+        self.session_search.clear();
         self.session_list = session::list();
         self.session_selected = 0;
         self.status = Status::SessionBrowser;
@@ -519,6 +535,25 @@ impl App {
                 );
                 self.messages.push(Message::assistant(text));
             }
+            "/tag" => {
+                if arg.is_empty() {
+                    if let Some(meta) = self.session_list.first() {
+                        self.messages.push(Message::assistant(format!(
+                            "tags for current session: {}",
+                            if meta.tags.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                meta.tags.join(", ")
+                            }
+                        )));
+                    } else {
+                        self.messages.push(Message::assistant("usage: /tag <name>"));
+                    }
+                } else {
+                    let _ = session::tag(&self.session_id, arg);
+                    self.messages.push(Message::assistant(format!("tagged session as \"{arg}\"")));
+                }
+            }
             "/undo" => {
                 if let Some(turn) = self.checkpoint_stack.pop() {
                     match crate::checkpoint::restore(&self.session_id, turn) {
@@ -589,7 +624,13 @@ impl App {
 
     fn resolve_permission(&mut self, always: bool, tx: mpsc::Sender<StreamEvent>) {
         if always {
-            self.always_allowed.insert(self.pending_calls[self.current_call_idx].name.clone());
+            let tool_name = self.pending_calls[self.current_call_idx].name.clone();
+            self.always_allowed.insert(tool_name.clone());
+            let mut cfg = Config::load();
+            if !cfg.always_allowed_tools.contains(&tool_name) {
+                cfg.always_allowed_tools.push(tool_name);
+                let _ = cfg.save();
+            }
         }
         self.status = Status::Executing;
         let call = self.pending_calls[self.current_call_idx].clone();

@@ -13,6 +13,8 @@ pub struct Config {
     pub base_urls: HashMap<String, String>,
     #[serde(default)]
     pub max_messages: Option<usize>,
+    #[serde(default)]
+    pub always_allowed_tools: Vec<String>,
 }
 
 impl Config {

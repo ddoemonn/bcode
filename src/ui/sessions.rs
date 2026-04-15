@@ -10,8 +10,14 @@ use ratatui::{
 use super::theme;
 
 pub fn render_list(f: &mut Frame, app: &App, area: Rect) {
+    let search_hint = if app.session_search.is_empty() {
+        " sessions  (type to filter) ".to_string()
+    } else {
+        format!(" sessions  /{} ", app.session_search)
+    };
+
     let block = Block::default()
-        .title(" sessions ")
+        .title(search_hint)
         .borders(Borders::ALL)
         .border_style(theme::border(theme::BORDER_INFO));
 
@@ -19,10 +25,12 @@ pub fn render_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     if app.session_list.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled("no saved sessions", theme::dim())),
-            inner,
-        );
+        let msg = if app.session_search.is_empty() {
+            "no saved sessions"
+        } else {
+            "no sessions match"
+        };
+        f.render_widget(Paragraph::new(Span::styled(msg, theme::dim())), inner);
         return;
     }
 
@@ -36,6 +44,12 @@ pub fn render_list(f: &mut Frame, app: &App, area: Rect) {
             s.title.clone()
         };
 
+        let tag_text = if s.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", s.tags.join(", "))
+        };
+
         if selected {
             Line::from(vec![
                 Span::styled(
@@ -45,7 +59,7 @@ pub fn render_list(f: &mut Frame, app: &App, area: Rect) {
                         .bg(theme::BORDER_INFO),
                 ),
                 Span::styled(
-                    format!("  {date} "),
+                    format!("{tag_text}  {date} "),
                     Style::default()
                         .fg(ratatui::style::Color::Black)
                         .bg(theme::BORDER_INFO),
@@ -54,6 +68,7 @@ pub fn render_list(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Line::from(vec![
                 Span::styled(format!("   {title}"), Style::default().fg(ratatui::style::Color::White)),
+                Span::styled(tag_text, Style::default().fg(theme::SUBTLE)),
                 Span::styled(format!("  {date}"), theme::dim()),
             ])
         }
