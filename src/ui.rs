@@ -21,8 +21,14 @@ pub fn render(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(outer[0]);
 
-    render_chat(f, app, panes[0]);
-    render_diff(f, app, panes[1]);
+    if app.status == Status::SessionBrowser {
+        render_session_list(f, app, panes[0]);
+        render_session_preview(f, app, panes[1]);
+    } else {
+        render_chat(f, app, panes[0]);
+        render_diff(f, app, panes[1]);
+    }
+
     render_status(f, app, outer[1]);
     render_input(f, app, outer[2]);
 }
@@ -81,16 +87,10 @@ fn render_chat(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_diff(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let title = match &app.status {
-        Status::AwaitingPermission => " Permission ",
-        Status::Executing => " Running ",
-        _ => " Diff ",
-    };
-
-    let border_color = match &app.status {
-        Status::AwaitingPermission => Color::Yellow,
-        Status::Executing => Color::Cyan,
-        _ => Color::DarkGray,
+    let (title, border_color) = match &app.status {
+        Status::AwaitingPermission => (" Permission ", Color::Yellow),
+        Status::Executing          => (" Running ",    Color::Cyan),
+        _                          => (" Diff ",       Color::DarkGray),
     };
 
     let block = Block::default()
@@ -102,56 +102,165 @@ fn render_diff(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(block, area);
 
     let content = if app.status == Status::AwaitingPermission {
-        if let Some(call) = app.pending_calls.get(app.current_call_idx) {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("tool  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(call.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::raw(""),
-            ];
-            if let Some(obj) = call.input.as_object() {
-                for (k, v) in obj {
-                    let val = v.as_str().unwrap_or(&v.to_string()).to_string();
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{k}  "), Style::default().fg(Color::DarkGray)),
-                        Span::raw(val),
-                    ]));
-                }
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(" allow once   "),
-                Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                Span::raw(" deny   "),
-                Span::styled("[a]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(" always"),
-            ]));
-            Text::from(lines)
-        } else {
-            Text::raw("")
-        }
+        render_permission_content(app)
     } else if app.diff_content.is_empty() {
         Text::from(vec![Line::from(Span::styled(
             "no changes yet",
             Style::default().fg(Color::DarkGray),
         ))])
     } else {
-        let lines: Vec<Line> = app.diff_content.lines().map(|l| {
-            if l.starts_with('+') {
-                Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Green)))
-            } else if l.starts_with('-') {
-                Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red)))
-            } else if l.starts_with('@') {
-                Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan)))
-            } else if l.starts_with("tool:") {
-                Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Yellow)))
+        Text::from(
+            app.diff_content
+                .lines()
+                .map(|l| {
+                    if l.starts_with("+ ") {
+                        Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Green)))
+                    } else if l.starts_with("- ") {
+                        Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red)))
+                    } else if l.starts_with('@') {
+                        Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Cyan)))
+                    } else if l.starts_with("tool:") {
+                        Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Yellow)))
+                    } else {
+                        Line::from(l.to_string())
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    f.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_permission_content(app: &App) -> Text<'static> {
+    let Some(call) = app.pending_calls.get(app.current_call_idx) else {
+        return Text::raw("");
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("tool  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(call.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::raw(""),
+    ];
+
+    if let Some(obj) = call.input.as_object() {
+        for (k, v) in obj {
+            let owned = v.to_string();
+            let val = v.as_str().unwrap_or(&owned).to_string();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{k}  "), Style::default().fg(Color::DarkGray)),
+                Span::raw(val),
+            ]));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(" allow once   "),
+        Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::raw(" deny   "),
+        Span::styled("[a]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" always"),
+    ]));
+
+    Text::from(lines)
+}
+
+fn render_session_list(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let block = Block::default()
+        .title(" Sessions ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.session_list.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled("no saved sessions", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    let lines: Vec<Line> = app
+        .session_list
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let selected = i == app.session_selected;
+            let date = s.updated_at.format("%m/%d %H:%M").to_string();
+            let title = if s.title.len() > (inner.width as usize).saturating_sub(12) {
+                format!("{}…", &s.title[..inner.width.saturating_sub(14) as usize])
             } else {
-                Line::from(l.to_string())
+                s.title.clone()
+            };
+
+            if selected {
+                Line::from(vec![
+                    Span::styled(
+                        format!("▶ {title}"),
+                        Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {date}"),
+                        Style::default().fg(Color::Black).bg(Color::Blue),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("  {title}"), Style::default().fg(Color::White)),
+                    Span::styled(format!("  {date}"), Style::default().fg(Color::DarkGray)),
+                ])
             }
-        }).collect();
-        Text::from(lines)
+        })
+        .collect();
+
+    let scroll = (app.session_selected as u16).saturating_sub(inner.height.saturating_sub(1));
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
+        inner,
+    );
+}
+
+fn render_session_preview(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let block = Block::default()
+        .title(" Preview ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let content = if let Some(meta) = app.session_list.get(app.session_selected) {
+        if let Ok(s) = crate::session::load(&meta.id) {
+            let lines: Vec<Line> = s
+                .messages
+                .iter()
+                .filter_map(|m| {
+                    let text = m.content.text();
+                    if text.is_empty() { return None; }
+                    let (label, color) = match m.role {
+                        Role::User      => ("you", Color::Cyan),
+                        Role::Assistant => ("ai ", Color::Green),
+                        Role::System    => return None,
+                    };
+                    let snippet = if text.len() > 80 { format!("{}…", &text[..77]) } else { text.to_string() };
+                    Some(Line::from(vec![
+                        Span::styled(format!("{label}  "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::raw(snippet),
+                    ]))
+                })
+                .collect();
+            Text::from(lines)
+        } else {
+            Text::from(Span::styled("failed to load", Style::default().fg(Color::Red)))
+        }
+    } else {
+        Text::from(Span::styled("no sessions", Style::default().fg(Color::DarkGray)))
     };
 
     f.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }), inner);
@@ -165,6 +274,7 @@ fn render_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         Status::Streaming          => Span::styled("◎ streaming",  Style::default().fg(Color::Yellow)),
         Status::AwaitingPermission => Span::styled("? permission", Style::default().fg(Color::Yellow)),
         Status::Executing          => Span::styled("⚙ executing",  Style::default().fg(Color::Cyan)),
+        Status::SessionBrowser     => Span::styled("⎗ sessions",   Style::default().fg(Color::Blue)),
         Status::Error(_)           => Span::styled("✗ error",      Style::default().fg(Color::Red)),
     };
 
@@ -193,14 +303,11 @@ fn render_status(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let (border_color, hint) = match &app.status {
-        Status::Streaming | Status::Executing => {
-            (Color::Yellow, "ctrl+c to interrupt")
-        }
-        Status::AwaitingPermission => {
-            (Color::Yellow, "y / n / a")
-        }
-        Status::Error(_) => (Color::Red, ""),
-        _ => (Color::Blue, ""),
+        Status::Streaming | Status::Executing => (Color::Yellow, "ctrl+c to interrupt"),
+        Status::AwaitingPermission            => (Color::Yellow, "y / n / a"),
+        Status::SessionBrowser                => (Color::Blue,   "↑↓ navigate   enter load   esc cancel"),
+        Status::Error(_)                      => (Color::Red,    ""),
+        _                                     => (Color::Blue,   ""),
     };
 
     let block = Block::default()
@@ -212,7 +319,7 @@ fn render_input(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let blocked = matches!(
         app.status,
-        Status::Streaming | Status::Executing | Status::AwaitingPermission
+        Status::Streaming | Status::Executing | Status::AwaitingPermission | Status::SessionBrowser
     );
 
     let prompt = Span::styled("> ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));

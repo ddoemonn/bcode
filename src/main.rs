@@ -1,5 +1,6 @@
 mod app;
 mod provider;
+mod session;
 mod tools;
 mod ui;
 
@@ -28,6 +29,9 @@ struct Cli {
 
     #[arg(short, long)]
     api_key: Option<String>,
+
+    #[arg(long, help = "Resume a saved session by ID")]
+    resume: Option<String>,
 }
 
 #[tokio::main]
@@ -57,5 +61,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    app::App::new(provider).run().await
+    let mut app = app::App::new(provider);
+
+    if let Some(id) = cli.resume {
+        let s = session::load(&id).context(format!("session {id} not found"))?;
+        app = app.with_session(s);
+    }
+
+    app.run().await
 }

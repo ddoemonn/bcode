@@ -1,5 +1,7 @@
 use crate::provider::{Message, Provider, StreamEvent};
+use crate::session::{self, Session, SessionMeta};
 use crate::tools;
+use chrono::Utc;
 use crossterm::{
     event::{Event, EventStream, KeyCode, KeyModifiers},
     execute,
@@ -29,6 +31,7 @@ pub enum Status {
     Streaming,
     AwaitingPermission,
     Executing,
+    SessionBrowser,
     Error(String),
 }
 
@@ -54,6 +57,9 @@ pub struct App {
     pub pending_calls: Vec<PendingCall>,
     pub current_call_idx: usize,
     pub always_allowed: HashSet<String>,
+    pub session_id: String,
+    pub session_list: Vec<SessionMeta>,
+    pub session_selected: usize,
     stream_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -73,8 +79,17 @@ impl App {
             pending_calls: Vec::new(),
             current_call_idx: 0,
             always_allowed: HashSet::new(),
+            session_id: session::new_id(),
+            session_list: Vec::new(),
+            session_selected: 0,
             stream_task: None,
         }
+    }
+
+    pub fn with_session(mut self, s: Session) -> Self {
+        self.messages = s.messages;
+        self.session_id = s.id;
+        self
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
@@ -135,6 +150,10 @@ impl App {
                         _ => return Ok(true),
                     }
                 }
+                KeyCode::Char('r') if self.status == Status::Ready => {
+                    self.open_session_browser();
+                    return Ok(false);
+                }
                 KeyCode::Char('u') if self.status == Status::Ready => {
                     self.input.clear();
                     self.cursor_pos = 0;
@@ -145,6 +164,24 @@ impl App {
         }
 
         match &self.status {
+            Status::SessionBrowser => {
+                match key.code {
+                    KeyCode::Up => {
+                        self.session_selected = self.session_selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let max = self.session_list.len().saturating_sub(1);
+                        self.session_selected = (self.session_selected + 1).min(max);
+                    }
+                    KeyCode::Enter => {
+                        self.load_selected_session();
+                    }
+                    KeyCode::Esc => {
+                        self.status = Status::Ready;
+                    }
+                    _ => {}
+                }
+            }
             Status::AwaitingPermission => {
                 match key.code {
                     KeyCode::Char('y') => self.resolve_permission(false, stream_tx),
@@ -195,6 +232,25 @@ impl App {
         Ok(false)
     }
 
+    fn open_session_browser(&mut self) {
+        self.session_list = session::list();
+        self.session_selected = 0;
+        self.status = Status::SessionBrowser;
+    }
+
+    fn load_selected_session(&mut self) {
+        let Some(meta) = self.session_list.get(self.session_selected) else { return };
+        let id = meta.id.clone();
+        if let Ok(s) = session::load(&id) {
+            self.messages = s.messages;
+            self.session_id = s.id;
+            self.streaming_text.clear();
+            self.auto_scroll = true;
+            self.scroll = u16::MAX;
+        }
+        self.status = Status::Ready;
+    }
+
     fn submit(&mut self, tx: mpsc::Sender<StreamEvent>) {
         let input = self.input.trim().to_string();
         if input.is_empty() { return; }
@@ -222,9 +278,9 @@ impl App {
     }
 
     fn resolve_permission(&mut self, always: bool, tx: mpsc::Sender<StreamEvent>) {
-        let call = &self.pending_calls[self.current_call_idx];
         if always {
-            self.always_allowed.insert(call.name.clone());
+            let name = self.pending_calls[self.current_call_idx].name.clone();
+            self.always_allowed.insert(name);
         }
         self.status = Status::Executing;
         let call = self.pending_calls[self.current_call_idx].clone();
@@ -232,7 +288,7 @@ impl App {
 
         tokio::spawn(async move {
             let output = tokio::task::spawn_blocking(move || {
-                tools::execute(call.name.as_str(), call.input.clone())
+                tools::execute(&call.name, call.input.clone())
                     .unwrap_or_else(|e| format!("error: {e}"))
             })
             .await
@@ -266,9 +322,8 @@ impl App {
             self.streaming_text.clear();
             self.spawn_stream(tx);
         } else {
-            let next = &self.pending_calls[self.current_call_idx];
-            if self.always_allowed.contains(&next.name) {
-                self.status = Status::Executing;
+            let name = self.pending_calls[self.current_call_idx].name.clone();
+            if self.always_allowed.contains(&name) {
                 self.resolve_permission(false, tx);
             } else {
                 self.status = Status::AwaitingPermission;
@@ -287,6 +342,17 @@ impl App {
         self.pending_calls.clear();
         self.current_call_idx = 0;
         self.status = Status::Ready;
+    }
+
+    fn autosave(&self) {
+        let s = Session {
+            id: self.session_id.clone(),
+            title: session::derive_title(&self.messages),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            messages: self.messages.clone(),
+        };
+        let _ = session::save(&s);
     }
 
     fn handle_stream(&mut self, event: StreamEvent, tx: mpsc::Sender<StreamEvent>) {
@@ -310,11 +376,9 @@ impl App {
                 self.current_call_idx = 0;
 
                 let first = &self.pending_calls[0];
-                let name = first.name.clone();
-                let display = format_input(&first.input);
-                self.diff_content = format!("tool: {name}\n\n{display}");
+                self.diff_content = format!("tool: {}\n\n{}", first.name, format_input(&first.input));
 
-                if self.always_allowed.contains(&name) {
+                if self.always_allowed.contains(&first.name) {
                     self.status = Status::Executing;
                     self.resolve_permission(false, tx);
                 } else {
@@ -326,12 +390,8 @@ impl App {
                 if let Some(call) = self.pending_calls.iter_mut().find(|c| c.id == id) {
                     call.result = Some(output.clone());
                 }
-                let name = self.pending_calls
-                    .iter()
-                    .find(|c| c.id == id)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-
+                let name = self.pending_calls.iter().find(|c| c.id == id)
+                    .map(|c| c.name.clone()).unwrap_or_default();
                 self.diff_content = format!("tool: {name}\n\n{output}");
                 self.advance_tool_queue(tx);
             }
@@ -345,6 +405,7 @@ impl App {
                 self.tokens.output = output_tokens;
                 self.status = Status::Ready;
                 self.stream_task = None;
+                self.autosave();
             }
 
             StreamEvent::Error(e) => {
