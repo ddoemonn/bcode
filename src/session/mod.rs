@@ -13,6 +13,8 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +23,7 @@ pub struct SessionMeta {
     pub title: String,
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
+    pub tags: Vec<String>,
 }
 
 pub fn new_id() -> String {
@@ -56,9 +59,24 @@ pub fn load(id: &str) -> Result<Session> {
     Ok(serde_json::from_str(&json)?)
 }
 
+pub fn tag(id: &str, tag: &str) -> Result<()> {
+    let mut session = load(id)?;
+    if !session.tags.contains(&tag.to_string()) {
+        session.tags.push(tag.to_string());
+        save(&session)?;
+    }
+    Ok(())
+}
+
 pub fn list() -> Vec<SessionMeta> {
+    list_filtered("")
+}
+
+pub fn list_filtered(query: &str) -> Vec<SessionMeta> {
     let Some(dir) = sessions_dir() else { return Vec::new() };
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+
+    let query_lower = query.to_lowercase();
 
     let mut metas: Vec<SessionMeta> = entries
         .filter_map(|e| e.ok())
@@ -66,11 +84,18 @@ pub fn list() -> Vec<SessionMeta> {
         .filter_map(|e| {
             let json = std::fs::read_to_string(e.path()).ok()?;
             let s: Session = serde_json::from_str(&json).ok()?;
+            if !query_lower.is_empty()
+                && !s.title.to_lowercase().contains(&query_lower)
+                && !s.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
+            {
+                return None;
+            }
             Some(SessionMeta {
                 id: s.id,
                 title: s.title,
                 updated_at: s.updated_at,
                 message_count: s.messages.len(),
+                tags: s.tags,
             })
         })
         .collect();

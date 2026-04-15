@@ -9,6 +9,10 @@ pub struct Config {
     pub model: Option<String>,
     #[serde(default)]
     pub api_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub base_urls: HashMap<String, String>,
+    #[serde(default)]
+    pub max_messages: Option<usize>,
 }
 
 impl Config {
