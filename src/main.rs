@@ -1,5 +1,6 @@
 mod app;
 mod provider;
+mod tools;
 mod ui;
 
 use anyhow::Context;

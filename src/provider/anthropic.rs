@@ -1,10 +1,12 @@
-use super::{Message, Provider, Role, StreamEvent};
+use super::{Message, Provider, Role, StreamEvent, ToolCallData};
+use crate::tools;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 pub struct AnthropicProvider {
@@ -23,17 +25,19 @@ impl AnthropicProvider {
 #[serde(tag = "type")]
 enum Event {
     #[serde(rename = "message_start")]
-    MessageStart { message: MessageStart },
+    MessageStart { message: MessageStartData },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart { index: usize, content_block: StartBlock },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: Delta },
+    ContentBlockDelta { index: usize, delta: Delta },
     #[serde(rename = "message_delta")]
-    MessageDelta { usage: MessageDeltaUsage },
+    MessageDelta { delta: MsgDelta, usage: MsgDeltaUsage },
     #[serde(other)]
     Other,
 }
 
 #[derive(Deserialize)]
-struct MessageStart {
+struct MessageStartData {
     usage: StartUsage,
 }
 
@@ -44,16 +48,35 @@ struct StartUsage {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum Delta {
-    #[serde(rename = "text_delta")]
+enum StartBlock {
+    #[serde(rename = "text")]
     Text { text: String },
-    #[serde(other)]
-    Other,
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
 }
 
 #[derive(Deserialize)]
-struct MessageDeltaUsage {
+#[serde(tag = "type")]
+enum Delta {
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
+}
+
+#[derive(Deserialize)]
+struct MsgDelta {
+    stop_reason: String,
+}
+
+#[derive(Deserialize)]
+struct MsgDeltaUsage {
     output_tokens: u32,
+}
+
+enum BlockState {
+    Text,
+    ToolUse { id: String, name: String, json_buf: String },
 }
 
 #[async_trait]
@@ -64,14 +87,10 @@ impl Provider for AnthropicProvider {
     async fn stream(&self, messages: &[Message], tx: mpsc::Sender<StreamEvent>) -> anyhow::Result<()> {
         let system = messages.iter()
             .find(|m| m.role == Role::System)
-            .map(|m| m.content.clone());
+            .map(|m| m.content.text().to_string());
 
-        let msgs: Vec<serde_json::Value> = messages.iter()
+        let msgs: Vec<&Message> = messages.iter()
             .filter(|m| m.role != Role::System)
-            .map(|m| json!({
-                "role": if m.role == Role::User { "user" } else { "assistant" },
-                "content": m.content,
-            }))
             .collect();
 
         let mut body = json!({
@@ -79,6 +98,7 @@ impl Provider for AnthropicProvider {
             "messages": msgs,
             "max_tokens": 8192,
             "stream": true,
+            "tools": tools::schemas(),
         });
 
         if let Some(sys) = system {
@@ -93,7 +113,7 @@ impl Provider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .context("failed to connect to Anthropic API")?;
+            .context("connect to Anthropic")?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -105,6 +125,8 @@ impl Provider for AnthropicProvider {
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut input_tokens = 0u32;
+        let mut accumulated_text = String::new();
+        let mut blocks: BTreeMap<usize, BlockState> = BTreeMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -127,16 +149,62 @@ impl Provider for AnthropicProvider {
                         Event::MessageStart { message } => {
                             input_tokens = message.usage.input_tokens;
                         }
-                        Event::ContentBlockDelta { delta: Delta::Text { text } } => {
-                            let _ = tx.send(StreamEvent::TextDelta(text)).await;
+
+                        Event::ContentBlockStart { index, content_block } => {
+                            match content_block {
+                                StartBlock::Text { .. } => {
+                                    blocks.insert(index, BlockState::Text);
+                                }
+                                StartBlock::ToolUse { id, name } => {
+                                    blocks.insert(index, BlockState::ToolUse {
+                                        id, name, json_buf: String::new(),
+                                    });
+                                }
+                            }
                         }
-                        Event::MessageDelta { usage } => {
-                            let _ = tx.send(StreamEvent::Done {
-                                input_tokens,
-                                output_tokens: usage.output_tokens,
-                            }).await;
+
+                        Event::ContentBlockDelta { index, delta } => match delta {
+                            Delta::Text { text } => {
+                                accumulated_text.push_str(&text);
+                                let _ = tx.send(StreamEvent::TextDelta(text)).await;
+                            }
+                            Delta::InputJson { partial_json } => {
+                                if let Some(BlockState::ToolUse { json_buf, .. }) = blocks.get_mut(&index) {
+                                    json_buf.push_str(&partial_json);
+                                }
+                            }
+                        },
+
+                        Event::MessageDelta { delta, usage } => {
+                            if delta.stop_reason == "tool_use" {
+                                let calls: Vec<ToolCallData> = blocks
+                                    .values()
+                                    .filter_map(|b| {
+                                        if let BlockState::ToolUse { id, name, json_buf } = b {
+                                            let input = serde_json::from_str(json_buf)
+                                                .unwrap_or(serde_json::Value::Object(Default::default()));
+                                            Some(ToolCallData { id: id.clone(), name: name.clone(), input })
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+
+                                let _ = tx.send(StreamEvent::ToolCalls {
+                                    calls,
+                                    accumulated_text: accumulated_text.clone(),
+                                    input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                }).await;
+                            } else {
+                                let _ = tx.send(StreamEvent::Done {
+                                    input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                }).await;
+                            }
                         }
-                        _ => {}
+
+                        Event::Other => {}
                     }
                 }
             }
