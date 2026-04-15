@@ -68,7 +68,13 @@ async fn main() -> anyhow::Result<()> {
         app.prepend_system(ctx);
     }
 
-    app.run().await
+    let result = app.run().await;
+
+    if let Err(ref e) = result {
+        eprintln!("bcode error: {e}");
+    }
+
+    result
 }
 
 fn try_build_provider(cli: &Cli, config: &Config) -> Option<Arc<dyn Provider>> {

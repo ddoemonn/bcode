@@ -139,8 +139,11 @@ impl App {
         let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
         let mut events = EventStream::new();
 
+        let shutdown_rx = spawn_shutdown_listener();
+
         loop {
             terminal.draw(|f| crate::ui::render(f, self))?;
+            self.trim_message_history();
 
             tokio::select! {
                 Some(Ok(event)) = events.next() => {
@@ -151,10 +154,36 @@ impl App {
                 Some(ev) = stream_rx.recv() => {
                     self.handle_stream(ev, stream_tx.clone());
                 }
+                _ = shutdown_rx.notified() => {
+                    self.autosave();
+                    break;
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn trim_message_history(&mut self) {
+        let max = Config::load().max_messages.unwrap_or(usize::MAX);
+        let non_system: usize = self
+            .messages
+            .iter()
+            .filter(|m| !matches!(m.role, crate::provider::Role::System))
+            .count();
+
+        if non_system > max {
+            let to_drop = non_system - max;
+            let mut dropped = 0;
+            self.messages.retain(|m| {
+                if dropped < to_drop && !matches!(m.role, crate::provider::Role::System) {
+                    dropped += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     async fn handle_event(
@@ -787,6 +816,30 @@ impl App {
             }
         }
     }
+}
+
+fn spawn_shutdown_listener() -> Arc<tokio::sync::Notify> {
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let n1 = Arc::clone(&notify);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sighup = signal(SignalKind::hangup()).unwrap();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+                _ = sighup.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        n1.notify_one();
+    });
+    notify
 }
 
 pub fn make_provider(name: &str, key: &str, model: &str) -> Arc<dyn Provider> {
